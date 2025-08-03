@@ -1,0 +1,9 @@
+{
+  "name": "Auto Slicer",
+  "author": "HellAholic",
+  "version": "1.7.0",
+  "description": "Automatically slice multiple STL/3MF models and save as UFP files with progress tracking.",
+  "api": "8",
+  "supported_sdk_versions": ["8.9.0"],
+  "supported_cura_versions": ["5.10.0"]
+}
