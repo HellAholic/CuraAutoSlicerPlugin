@@ -22,8 +22,6 @@ from UM.Math.Matrix import Matrix
 from UM.Mesh.ReadMeshJob import ReadMeshJob
 from UM.Operations.AddSceneNodeOperation import AddSceneNodeOperation
 from UM.Signal import Signal
-from UM.FileHandler.FileWriter import FileWriter
-from UM.FileHandler.WriteFileJob import WriteFileJob
 
 from cura.CuraApplication import CuraApplication
 from cura.Scene.BuildPlateDecorator import BuildPlateDecorator
@@ -39,12 +37,8 @@ import time
 import os
 import csv
 from datetime import datetime
-from typing import Optional
 from typing import Dict, Any
 import shutil
-import xml.etree.ElementTree as ET
-import zipfile
-
 
 class AutoSlicerJob(Job):
     """Background job for processing multiple 3D models through Cura's slicing pipeline."""
@@ -125,11 +119,9 @@ class AutoSlicerJob(Job):
             
             # This indicates the slice was cancelled from Cura's UI
             self._slice_cancelled = True
-            Logger.log("i", "Slice cancellation detected from Cura UI")
             
             # If we're currently in auto-slice mode, treat this as a skip request
             if not self._is_stopping and not self._is_skipping:
-                Logger.log("i", "Auto-slice process will skip current file due to Cura UI cancellation")
                 self._is_skipping = True
 
     def stop(self):
@@ -150,7 +142,6 @@ class AutoSlicerJob(Job):
         if not self._is_stopping:
             self._is_skipping = True
             self._slice_cancelled = False  # Reset cancellation flag when manually skipping
-            Logger.log("i", f"Skipping current file: {os.path.basename(self._current_model_path)}")
             
             # Cancel any ongoing slice operation
             try:
@@ -182,7 +173,6 @@ class AutoSlicerJob(Job):
             for index, item in enumerate(self._file_profile_map):                
                 if self._is_stopping:
                     self.statusChanged.emit("Processing stopped by user")
-                    Logger.log("i", "Processing stopped by user in main loop")
                     break
                 
                 model_filename = item["file"]
@@ -206,6 +196,9 @@ class AutoSlicerJob(Job):
             self.statusChanged.emit("Restoring original machine state...")
             self._restoreOriginalMachineState()
             
+            # Validate and fix any machine state issues after restoration
+            self._validateMachineState()
+            
             self.progress.emit(100)
             self.statusChanged.emit(f"Completed processing {self._results['success_count']} files successfully")
             
@@ -213,6 +206,8 @@ class AutoSlicerJob(Job):
             Logger.logException("e", f"AutoSlicerJob failed: {str(e)}")
             self.statusChanged.emit(f"Job failed: {str(e)}")
             self._restoreOriginalMachineState()
+            # Validate and fix any issues even after errors
+            self._validateMachineState()
         finally:
             self._cleanup()
 
@@ -946,159 +941,105 @@ class AutoSlicerJob(Job):
             return False
 
     def _switchQualityProfile(self, profile_id: str, intent_category: str = None, intent_container_id: str = None) -> bool:
-        """Switch to the specified quality profile and intent."""
-        try:            
+        """Switch to the specified quality profile using Cura's high-level group management API."""
+        try:
+            machine_manager = self._machine_manager
+            if not machine_manager:
+                Logger.log("e", "No machine manager found")
+                return False
+            
             container_registry = self._application.getContainerRegistry()
             
-            quality_containers = container_registry.findInstanceContainers(type="quality", id=profile_id)
+            # Check if it's a quality_changes (custom profile)
             quality_changes_containers = container_registry.findInstanceContainers(type="quality_changes", id=profile_id)
-            
-            target_container = None
-            container_type = None
-            
-            if quality_containers:
-                target_container = quality_containers[0]
-                container_type = "quality"
-            elif quality_changes_containers:
-                target_container = quality_changes_containers[0]
-                container_type = "quality_changes"
-            else:
-                Logger.log("e", f"Profile not found in quality or quality_changes containers: {profile_id}")
-                return False
-            
-            active_machine = self._machine_manager.activeMachine
-            if not active_machine:
-                Logger.log("e", "No active machine found")
-                return False
+            if quality_changes_containers:
+                # For custom profiles, find the quality changes group
+                quality_changes = quality_changes_containers[0]
                 
-            if container_type == "quality_changes":
-                quality_type = target_container.getMetaDataEntry("quality_type", "default")
+                # Get the container tree to find the quality changes group
+                container_tree = ContainerTree.getInstance()
                 
-                base_quality_containers = container_registry.findInstanceContainers(
-                    type="quality",
-                    quality_type=quality_type
-                )
+                # Find the quality changes group for this profile
+                quality_changes_groups = container_tree.getCurrentQualityChangesGroups()
+                target_group = None
                 
-                # Enhanced inheritance checking for quality_changes compatibility
-                machine_definition_id = active_machine.definition.getId()
-                inherited_from = active_machine.definition.getMetaDataEntry("inherits", "")
-                quality_definition = active_machine.definition.getMetaDataEntry("quality_definition", machine_definition_id)
-                
-                # Build list of compatible definition IDs
-                compatible_definitions = [machine_definition_id]
-                if inherited_from and inherited_from not in compatible_definitions:
-                    compatible_definitions.append(inherited_from)
-                if quality_definition and quality_definition not in compatible_definitions:
-                    compatible_definitions.append(quality_definition)
-                
-                compatible_base = None
-                
-                # Try to find compatible base using enhanced inheritance
-                for base_quality in base_quality_containers:
-                    base_definition = base_quality.getMetaDataEntry("definition", "")
-                    if base_definition in compatible_definitions:
-                        compatible_base = base_quality
+                for group in quality_changes_groups:
+                    if hasattr(group, 'name') and group.name == quality_changes.getName():
+                        target_group = group
                         break
+                    # Also check if the group contains our target container
+                    if hasattr(group, 'quality_changes_containers'):
+                        for container in group.quality_changes_containers.values():
+                            if container and container.getId() == profile_id:
+                                target_group = group
+                                break
                 
-                if not compatible_base:
-                    try:
-                        container_tree = ContainerTree.getInstance()
-                        
-                        machine_node = container_tree.machines.get(machine_definition_id)
-                        if machine_node:
-                            variant_names = [extruder.variant.getName() for extruder in active_machine.extruderList]
-                            material_bases = [extruder.material.getMetaDataEntry("base_file") for extruder in active_machine.extruderList]
-                            
-                            variant_name = variant_names[0] if variant_names else None
-                            material_base = material_bases[0] if material_bases else None
-                            
-                            if variant_name and material_base:
-                                variant_node = machine_node.variants.get(variant_name)
-                                if variant_node:
-                                    material_node = variant_node.materials.get(material_base)
-                                    if material_node:
-                                        for quality_node in material_node.qualities.values():
-                                            if quality_node.quality_type == quality_type and quality_node.container:
-                                                compatible_base = quality_node.container
-                                                break
-                                                
-                    except Exception as tree_error:
-                        Logger.log("w", f"ContainerTree fallback failed: {tree_error}")
-                
-                if not compatible_base and base_quality_containers:
-                    compatible_base = base_quality_containers[0]
-                    Logger.log("w", f"Using fallback base quality: {compatible_base.getName()} (definition: {compatible_base.getMetaDataEntry('definition', 'unknown')})")
-                
-                if not compatible_base:
-                    Logger.log("e", f"No compatible base quality profile found for quality_type: {quality_type}")
-                    return False
-                    
-                active_machine.setQuality(compatible_base)
-                active_machine.setQualityChanges(target_container)
-                
-            else:
-                # For machine quality profiles (not user-defined quality_changes),
-                # explicitly clear any existing quality_changes to prevent conflicts
-                active_machine.setQuality(target_container)
-                
-                # Clear quality_changes to prevent user-defined settings from being applied on top
-                try:
-                    empty_quality_changes = container_registry.findInstanceContainers(
-                        type="quality_changes", 
-                        name="empty"
-                    )
-                    if empty_quality_changes:
-                        active_machine.setQualityChanges(empty_quality_changes[0])
+                if target_group:
+                    # Use the high-level group method
+                    machine_manager.setQualityChangesGroup(target_group, no_dialog=True)
+                else:
+                    # Fallback to direct setting
+                    active_machine = machine_manager.activeMachine
+                    if active_machine:
+                        active_machine.setQualityChanges(quality_changes)
                     else:
-                        # Try alternative method to clear quality changes
-                        active_machine.qualityChanges = None
-                except Exception as clear_error:
-                    Logger.log("w", f"Failed to clear quality_changes: {clear_error}")
-                    # Continue anyway - the profile switch may still work
+                        Logger.log("e", "No active machine for fallback")
+                        return False
+            else:
+                # Check if it's a base quality profile
+                quality_containers = container_registry.findInstanceContainers(type="quality", id=profile_id)
+                if quality_containers:
+                    quality = quality_containers[0]
+                    
+                    # Get the container tree to find the quality group
+                    container_tree = ContainerTree.getInstance()
+                    
+                    # Find the quality group for this profile
+                    quality_groups = container_tree.getCurrentQualityGroups()
+                    target_group = None
+                    
+                    for group_name, group in quality_groups.items():
+                        if hasattr(group, 'quality_type') and group.quality_type == quality.getMetaDataEntry("quality_type"):
+                            target_group = group
+                            break
+                    
+                    if target_group:
+                        # Use the high-level group method
+                        machine_manager.setQualityGroup(target_group, no_dialog=True, global_stack=None)
+                    else:
+                        # Fallback to direct setting
+                        active_machine = machine_manager.activeMachine
+                        if active_machine:
+                            active_machine.setQuality(quality)
+                            
+                            # Clear any existing quality_changes
+                            empty_quality_changes = container_registry.findInstanceContainers(
+                                type="quality_changes", 
+                                name="empty"
+                            )
+                            if empty_quality_changes:
+                                active_machine.setQualityChanges(empty_quality_changes[0])
+                        else:
+                            Logger.log("e", "No active machine for fallback")
+                            return False
+                else:
+                    Logger.log("e", f"Profile not found: {profile_id}")
+                    return False
             
-            try:
-                backend = self._application.getBackend()
-                if backend and hasattr(backend, 'settingsChanged'):
-                    backend.settingsChanged.emit()
-                time.sleep(0.3)
-                
-            except Exception as refresh_error:
-                Logger.log("w", f"Failed to refresh settings: {refresh_error}")
-            
+            # Set intent if specified
             if intent_category:
-                self._setIntent(intent_category, intent_container_id)
+                try:
+                    machine_manager.setIntentByCategory(intent_category)
+                except Exception as intent_error:
+                    Logger.log("w", f"Failed to set intent {intent_category}: {intent_error}")
             
-            try:
-                current_quality_changes = active_machine.qualityChanges.getName() if active_machine.qualityChanges else "None"
-                
-                if container_type == "quality_changes" and current_quality_changes == "empty":
-                    Logger.log("w", "Quality changes was reset to empty, attempting to reapply...")
-                    active_machine.setQualityChanges(target_container)
-                    time.sleep(0.1)
-                                    
-            except Exception as verify_error:
-                Logger.log("w", f"Failed to verify settings: {verify_error}")
+            # Give Cura time to process the changes and update the UI
+            time.sleep(0.2)
             
             return True
                 
         except Exception as e:
             Logger.logException("e", f"Error switching quality profile: {str(e)}")
-            return False
-
-    def _setIntent(self, intent_category: str, intent_container_id: str = None) -> bool:
-        """Set the intent for the active machine using the proper Cura API."""
-        try:
-            machine_manager = self._machine_manager
-            
-            if not machine_manager:
-                Logger.log("e", "No machine manager found for setting intent")
-                return False
-            
-            machine_manager.setIntentByCategory(intent_category)                
-            return True
-                
-        except Exception as e:
-            Logger.logException("e", f"Error setting intent: {str(e)}")
             return False
 
     def _storeOriginalMachineState(self):
@@ -1111,12 +1052,6 @@ class AutoSlicerJob(Job):
                 quality_changes_id = active_machine.qualityChanges.getId()
                 intent_category = self._machine_manager.activeIntentCategory
                 
-                # Log what we're storing for debugging
-                Logger.log("i", f"Storing original machine state:")
-                Logger.log("i", f"  Quality ID: {quality_id}")
-                Logger.log("i", f"  Quality changes ID: {quality_changes_id}")
-                Logger.log("i", f"  Intent category: {intent_category}")
-                
                 # Validate and store the IDs
                 self._original_quality_id = quality_id if quality_id and quality_id.lower() not in ["none", ""] else None
                 self._original_quality_changes_id = quality_changes_id if quality_changes_id and quality_changes_id.lower() not in ["none", ""] else None
@@ -1124,7 +1059,6 @@ class AutoSlicerJob(Job):
                 
                 # If quality_changes_id is "not_supported", store as None to prevent restoration issues
                 if self._original_quality_changes_id and self._original_quality_changes_id.lower() == "not_supported":
-                    Logger.log("w", "Original quality changes is 'not_supported', storing as None to prevent restoration issues")
                     self._original_quality_changes_id = None
                     
             else:
@@ -1140,73 +1074,165 @@ class AutoSlicerJob(Job):
             self._original_intent_category = None
 
     def _restoreOriginalMachineState(self):
-        """Restore the original machine state after processing."""
+        """Restore the original machine state after processing using the correct Cura API."""
         try:
-            # Determine which profile to restore
-            profile_id_to_restore = None
-            restore_type = None
+            machine_manager = self._machine_manager
+            if not machine_manager:
+                Logger.log("w", "No machine manager found for restoration")
+                return
             
-            # Enhanced validation of stored state before attempting restoration
-            Logger.log("i", f"Attempting to restore original machine state...")
-            Logger.log("i", f"  Original quality ID: {self._original_quality_id}")
-            Logger.log("i", f"  Original quality changes ID: {self._original_quality_changes_id}")
-            Logger.log("i", f"  Original intent category: {self._original_intent_category}")
+            active_machine = machine_manager.activeMachine
+            if not active_machine:
+                Logger.log("w", "No active machine found for restoration")
+                return
             
-            # If we have a quality_changes (user-defined profile), prioritize that
+            # Determine which profile to restore - prioritize quality_changes over base quality
             if (self._original_quality_changes_id and 
                 self._original_quality_changes_id.lower() not in ["empty", "not_supported", "none"]):
-                # Verify the quality_changes profile still exists before trying to restore it
-                container_registry = self._application.getContainerRegistry()
-                quality_changes_containers = container_registry.findInstanceContainers(
-                    type="quality_changes", 
-                    id=self._original_quality_changes_id
-                )
                 
-                if quality_changes_containers:
-                    profile_id_to_restore = self._original_quality_changes_id
-                    restore_type = "quality_changes"
-                    Logger.log("i", f"Will restore original custom profile (quality changes): {self._original_quality_changes_id}")
-                else:
-                    Logger.log("w", f"Original quality_changes profile no longer exists: {self._original_quality_changes_id}")
-                    # Fall back to base quality profile
-                    if self._original_quality_id:
-                        profile_id_to_restore = self._original_quality_id
-                        restore_type = "quality"
-                        Logger.log("i", f"Falling back to original quality profile: {self._original_quality_id}")
-            elif self._original_quality_id and self._original_quality_id.lower() not in ["empty", "not_supported", "none"]:
-                # Verify the quality profile still exists before trying to restore it
-                container_registry = self._application.getContainerRegistry()
-                quality_containers = container_registry.findInstanceContainers(
-                    type="quality", 
-                    id=self._original_quality_id
-                )
-                
-                if quality_containers:
-                    profile_id_to_restore = self._original_quality_id
-                    restore_type = "quality"
-                    Logger.log("i", f"Will restore original quality profile: {self._original_quality_id}")
-                else:
-                    Logger.log("w", f"Original quality profile no longer exists: {self._original_quality_id}")
-            
-            if profile_id_to_restore:                
-                success = self._switchQualityProfile(profile_id_to_restore, self._original_intent_category)
+                # Try to restore custom profile using the working method
+                success = self._switchQualityProfile(self._original_quality_changes_id, self._original_intent_category)
                 if success:
-                    Logger.log("i", f"Successfully restored original machine state to {restore_type}: {profile_id_to_restore}")
+                    Logger.log("i", f"Restored original custom profile: {self._original_quality_changes_id}")
                 else:
-                    Logger.log("w", f"Failed to restore original {restore_type} profile: {profile_id_to_restore}")
-                    # Try to at least clear any problematic quality_changes to prevent UI issues
-                    self._clearQualityChanges()
+                    Logger.log("w", "Failed to restore custom profile, trying base quality")
+                    if self._original_quality_id:
+                        self._restoreBaseQuality()
+                        
+            elif self._original_quality_id and self._original_quality_id.lower() not in ["empty", "not_supported", "none"]:
+                self._restoreBaseQuality()
             else:
-                Logger.log("w", "No valid original machine state to restore - clearing quality changes to prevent issues")
-                self._clearQualityChanges()
+                Logger.log("w", "No valid original profile to restore")
+                
+            # Restore intent if specified
+            if self._original_intent_category:
+                try:
+                    machine_manager.setIntentByCategory(self._original_intent_category)
+                    Logger.log("i", f"Restored original intent: {self._original_intent_category}")
+                except Exception as intent_error:
+                    Logger.log("w", f"Failed to restore intent: {intent_error}")
                 
         except Exception as e:
             Logger.logException("e", f"Error restoring original machine state: {str(e)}")
-            # Try to clear quality changes to prevent UI issues
+            # Try to clear problematic states as fallback
             try:
                 self._clearQualityChanges()
-            except:
-                pass
+            except Exception as fallback_error:
+                Logger.log("w", f"Fallback quality changes clearing also failed: {fallback_error}")
+
+    def _restoreBaseQuality(self):
+        """Restore base quality profile using the correct API."""
+        try:
+            success = self._switchQualityProfile(self._original_quality_id, self._original_intent_category)
+            if success:
+                Logger.log("i", f"Restored original base quality: {self._original_quality_id}")
+            else:
+                Logger.log("w", "Failed to restore original quality profile")
+        except Exception as q_error:
+            Logger.log("w", f"Failed to restore quality: {q_error}")
+
+    def _restoreProfileWithUserSettings(self, profile_id: str, intent_category: str = None) -> bool:
+        """Restore a profile while preserving and restoring original user settings."""
+        try:
+            container_registry = self._application.getContainerRegistry()
+            active_machine = self._machine_manager.activeMachine
+            
+            if not active_machine:
+                Logger.log("e", "No active machine found for profile restoration")
+                return False
+            
+            # Find the profile to restore
+            quality_containers = container_registry.findInstanceContainers(type="quality", id=profile_id)
+            quality_changes_containers = container_registry.findInstanceContainers(type="quality_changes", id=profile_id)
+            
+            target_container = None
+            container_type = None
+            
+            if quality_containers:
+                target_container = quality_containers[0]
+                container_type = "quality"
+            elif quality_changes_containers:
+                target_container = quality_changes_containers[0]
+                container_type = "quality_changes"
+            else:
+                Logger.log("e", f"Profile not found for restoration: {profile_id}")
+                return False
+            
+            # Restore the profile
+            if container_type == "quality_changes":
+                # For quality_changes, we need to find and set the appropriate base quality
+                quality_type = target_container.getMetaDataEntry("quality_type", "default")
+                
+                # Find compatible base quality
+                base_quality_containers = container_registry.findInstanceContainers(
+                    type="quality",
+                    quality_type=quality_type
+                )
+                
+                # Use inheritance-aware matching
+                machine_definition_id = active_machine.definition.getId()
+                compatible_definitions = [machine_definition_id]
+                
+                # Add inherited definitions
+                inherited_from = active_machine.definition.getMetaDataEntry("inherits", "")
+                if inherited_from:
+                    compatible_definitions.append(inherited_from)
+                
+                quality_definition = active_machine.definition.getMetaDataEntry("quality_definition", machine_definition_id)
+                if quality_definition and quality_definition not in compatible_definitions:
+                    compatible_definitions.append(quality_definition)
+                
+                compatible_base = None
+                for base_quality in base_quality_containers:
+                    base_definition = base_quality.getMetaDataEntry("definition", "")
+                    if base_definition in compatible_definitions:
+                        compatible_base = base_quality
+                        break
+                
+                if not compatible_base and base_quality_containers:
+                    compatible_base = base_quality_containers[0]
+                
+                if compatible_base:
+                    active_machine.setQuality(compatible_base)
+                    active_machine.setQualityChanges(target_container)
+                else:
+                    Logger.log("e", f"No compatible base quality found for restoration")
+                    return False
+            else:
+                # For base quality profiles, set the quality and clear quality_changes
+                active_machine.setQuality(target_container)
+                
+                # Clear quality_changes
+                empty_quality_changes = container_registry.findInstanceContainers(
+                    type="quality_changes", 
+                    name="empty"
+                )
+                if empty_quality_changes:
+                    active_machine.setQualityChanges(empty_quality_changes[0])
+            
+            # Set intent if specified
+            if intent_category:
+                try:
+                    self._machine_manager.setIntentByCategory(intent_category)
+                except Exception as intent_error:
+                    Logger.log("w", f"Failed to restore intent category {intent_category}: {intent_error}")
+            
+            # Restore original user setting overrides
+            self._restoreUserSettingOverrides()
+            
+            # Trigger settings refresh
+            try:
+                backend = self._application.getBackend()
+                if backend and hasattr(backend, 'settingsChanged'):
+                    backend.settingsChanged.emit()
+            except Exception as refresh_error:
+                Logger.log("w", f"Failed to refresh settings during restoration: {refresh_error}")
+            
+            return True
+            
+        except Exception as e:
+            Logger.logException("e", f"Error in profile restoration with user settings: {str(e)}")
+            return False
 
     def _clearQualityChanges(self):
         """Clear quality changes to prevent 'not_supported' profile issues."""
@@ -1215,18 +1241,90 @@ class AutoSlicerJob(Job):
             active_machine = self._machine_manager.activeMachine
             
             if active_machine:
-                # Find and set empty quality changes
+                # Find and set empty quality changes for global container
                 empty_quality_changes = container_registry.findInstanceContainers(
                     type="quality_changes", 
                     name="empty"
                 )
                 if empty_quality_changes:
                     active_machine.setQualityChanges(empty_quality_changes[0])
-                    Logger.log("i", "Cleared quality changes to prevent profile issues")
-                else:
-                    Logger.log("w", "Could not find empty quality changes container")
+                    Logger.log("i", "Cleared global quality changes to prevent profile issues")
+                
+                # Also clear quality changes for all extruders to prevent extruder errors
+                for extruder_index, extruder in enumerate(active_machine.extruderList):
+                    try:
+                        # Find empty quality changes for this extruder
+                        extruder_empty_quality_changes = container_registry.findInstanceContainers(
+                            type="quality_changes",
+                            name="empty",
+                            extruder=str(extruder_index)
+                        )
+                        
+                        if not extruder_empty_quality_changes:
+                            # Fallback to generic empty quality changes
+                            extruder_empty_quality_changes = empty_quality_changes
+                        
+                        if extruder_empty_quality_changes:
+                            extruder.setQualityChanges(extruder_empty_quality_changes[0])
+                            Logger.log("d", f"Cleared quality changes for extruder {extruder_index}")
+                    except Exception as extruder_error:
+                        Logger.log("w", f"Failed to clear quality changes for extruder {extruder_index}: {extruder_error}")
+                
+                # Trigger settings refresh to update UI
+                try:
+                    backend = self._application.getBackend()
+                    if backend and hasattr(backend, 'settingsChanged'):
+                        backend.settingsChanged.emit()
+                except Exception as refresh_error:
+                    Logger.log("w", f"Failed to refresh settings after clearing quality changes: {refresh_error}")
+                
+            else:
+                Logger.log("w", "Could not find active machine to clear quality changes")
         except Exception as e:
             Logger.log("w", f"Failed to clear quality changes: {e}")
+
+    def _validateMachineState(self):
+        """Validate the current machine state and fix common issues."""
+        try:
+            active_machine = self._machine_manager.activeMachine
+            if not active_machine:
+                Logger.log("w", "No active machine found for validation")
+                return False
+            
+            # Check if quality_changes are in a problematic state
+            quality_changes = active_machine.qualityChanges
+            if quality_changes:
+                quality_changes_name = quality_changes.getName().lower()
+                if quality_changes_name in ["not_supported", "not supported"]:
+                    Logger.log("w", "Detected 'not_supported' quality changes, clearing...")
+                    self._clearQualityChanges()
+            
+            # Validate extruder states
+            for extruder_index, extruder in enumerate(active_machine.extruderList):
+                try:
+                    extruder_quality_changes = extruder.qualityChanges
+                    if extruder_quality_changes:
+                        extruder_qc_name = extruder_quality_changes.getName().lower()
+                        if extruder_qc_name in ["not_supported", "not supported"]:
+                            Logger.log("w", f"Detected 'not_supported' quality changes for extruder {extruder_index}, clearing...")
+                            
+                            # Find and set empty quality changes for this specific extruder
+                            container_registry = self._application.getContainerRegistry()
+                            empty_quality_changes = container_registry.findInstanceContainers(
+                                type="quality_changes", 
+                                name="empty"
+                            )
+                            if empty_quality_changes:
+                                extruder.setQualityChanges(empty_quality_changes[0])
+                                Logger.log("d", f"Fixed extruder {extruder_index} quality changes")
+                except Exception as extruder_error:
+                    Logger.log("w", f"Error validating extruder {extruder_index}: {extruder_error}")
+            
+            return True
+            
+        except Exception as e:
+            Logger.logException("e", f"Error validating machine state: {str(e)}")
+            return False
 
     def _moveToSlicedFolder(self, original_path: str):
         """Move the original file to a 'sliced' subfolder."""
