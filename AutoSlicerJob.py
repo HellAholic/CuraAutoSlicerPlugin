@@ -119,7 +119,6 @@ class AutoSlicerJob(Job):
             
             # This indicates the slice was cancelled from Cura's UI
             self._slice_cancelled = True
-            Logger.log("i", "Slice cancellation detected from Cura UI")
             
             # If we're currently in auto-slice mode, treat this as a skip request
             if not self._is_stopping and not self._is_skipping:
@@ -174,7 +173,6 @@ class AutoSlicerJob(Job):
             for index, item in enumerate(self._file_profile_map):                
                 if self._is_stopping:
                     self.statusChanged.emit("Processing stopped by user")
-                    Logger.log("i", "Processing stopped by user in main loop")
                     break
                 
                 model_filename = item["file"]
