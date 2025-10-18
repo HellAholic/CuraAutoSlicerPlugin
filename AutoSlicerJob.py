@@ -214,7 +214,10 @@ class AutoSlicerJob(Job):
     def _discoverFiles(self):
         """Discover and filter STL/3MF files in the source folder."""
         if not os.path.exists(self._source_folder):
-            raise FileNotFoundError(f"Source folder does not exist: {self._source_folder}")
+            error_msg = f"Source folder does not exist: {self._source_folder}"
+            Logger.log("e", error_msg)
+            self.statusChanged.emit(f"Error: {error_msg}")
+            return
         
         self._model_list = []
         
@@ -266,18 +269,23 @@ class AutoSlicerJob(Job):
                 Logger.log("e", f"Failed to load model {model_filename}")
                 # Check if this was a user interruption
                 if self._is_stopping:
-                    raise Exception("Processing stopped by user")
+                    return
                 
-                # Check for more specific load failure reasons
+                # Check for more specific load failure reasons and log appropriately
                 file_size_mb = os.path.getsize(model_path) / (1024 * 1024)
                 file_ext = os.path.splitext(model_path)[1].lower()
                 
                 if file_size_mb > 100:  # Large file
-                    raise Exception(f"Failed to load model file (file size: {file_size_mb:.1f}MB). Large files may cause loading issues.")
+                    error_msg = f"Failed to load model file (file size: {file_size_mb:.1f}MB). Large files may cause loading issues."
                 elif file_ext not in ['.stl', '.3mf', '.obj', '.ply']:  # Unsupported format
-                    raise Exception(f"Failed to load model file. Unsupported file format: {file_ext}")
+                    error_msg = f"Failed to load model file. Unsupported file format: {file_ext}"
                 else:
-                    raise Exception(f"Failed to load model file. The file may be corrupted or contain invalid geometry.")
+                    error_msg = f"Failed to load model file. The file may be corrupted or contain invalid geometry."
+                
+                Logger.log("e", error_msg)
+                filename = os.path.basename(model_path)
+                self._addError(filename, model_path, error_msg)
+                return
             
             # Skip positioning for 3MF files (UCP handles positioning)
             file_ext = os.path.splitext(model_path)[1].lower()
@@ -292,7 +300,7 @@ class AutoSlicerJob(Job):
                 Logger.log("e", f"Failed to slice model {model_filename}")
                 # Check if this was a user interruption
                 if self._is_stopping:
-                    raise Exception("Processing stopped by user")
+                    return
                 elif self._is_skipping:
                     # File was skipped
                     filename = os.path.basename(model_path)
@@ -314,7 +322,11 @@ class AutoSlicerJob(Job):
                     self.fileSkipped.emit(filename, "Cancelled from Cura UI")
                     return  # Skip to next file
                 else:
-                    raise Exception("Failed to slice model. This could be due to invalid geometry, print settings issues, or insufficient memory.")
+                    error_msg = "Failed to slice model. This could be due to invalid geometry, print settings issues, or insufficient memory."
+                    Logger.log("e", error_msg)
+                    filename = os.path.basename(model_path)
+                    self._addError(filename, model_path, error_msg)
+                    return
             
             # Check again after slicing in case user skipped or cancelled during slice
             if self._is_skipping:
@@ -341,36 +353,39 @@ class AutoSlicerJob(Job):
                 Logger.log("e", f"Failed to save output file for {model_filename}")
                 # Check if this was a user interruption
                 if self._is_stopping:
-                    raise Exception("Processing stopped by user")
+                    return
                 
-                # Check for more specific save failure reasons
+                # Check for more specific save failure reasons and log appropriately
                 dest_folder = self._destination_folder
+                error_msg = "Failed to save output file"
                 try:
                     # Check disk space
                     import shutil
                     free_space = shutil.disk_usage(dest_folder).free / (1024 * 1024)  # MB
                     if free_space < 100:  # Less than 100MB
-                        raise Exception(f"Failed to save output file. Insufficient disk space (only {free_space:.1f}MB available).")
-                    
-                    # Check write permissions
-                    test_file = os.path.join(dest_folder, "test_write_permission.tmp")
-                    try:
-                        with open(test_file, 'w') as f:
-                            f.write("test")
-                        os.remove(test_file)
-                    except PermissionError:
-                        raise Exception(f"Failed to save output file. No write permission to destination folder: {dest_folder}")
-                    except Exception:
-                        raise Exception(f"Failed to save output file. Cannot write to destination folder: {dest_folder}")
-                    
-                    # Generic save failure
-                    raise Exception(f"Failed to save output file. The slicing process may have failed or the output format is not supported.")
+                        error_msg = f"Failed to save output file. Insufficient disk space (only {free_space:.1f}MB available)."
+                    else:
+                        # Check write permissions
+                        test_file = os.path.join(dest_folder, "test_write_permission.tmp")
+                        try:
+                            with open(test_file, 'w') as f:
+                                f.write("test")
+                            os.remove(test_file)
+                        except PermissionError:
+                            error_msg = f"Failed to save output file. No write permission to destination folder: {dest_folder}"
+                        except Exception:
+                            error_msg = f"Failed to save output file. Cannot write to destination folder: {dest_folder}"
+                        else:
+                            # Generic save failure
+                            error_msg = f"Failed to save output file. The slicing process may have failed or the output format is not supported."
                 
                 except Exception as check_error:
-                    if "Failed to save output file" in str(check_error):
-                        raise check_error
-                    else:
-                        raise Exception(f"Failed to save output file. {str(check_error)}")
+                    error_msg = f"Failed to save output file. {str(check_error)}"
+                
+                Logger.log("e", error_msg)
+                filename = os.path.basename(model_path)
+                self._addError(filename, model_path, error_msg)
+                return
             
             self._moveToSlicedFolder(model_path)
             self._logToCSV(model_filename, model_path, self._last_output_path, "completed")
@@ -379,15 +394,9 @@ class AutoSlicerJob(Job):
             
         except Exception as e:
             error_msg = str(e)
-            
-            # Special handling for user interruption - don't log as an error
-            if "Processing stopped by user" in error_msg:
-                Logger.log("i", f"Processing of {model_filename} stopped by user")
-                # Don't add to error count for user interruptions
-                return
-            else:
-                Logger.logException("e", f"Failed to process {model_filename}: {error_msg}")
-                self._addError(model_filename, model_path, error_msg)
+            Logger.logException("e", f"Error processing {model_filename}: {error_msg}")
+            filename = os.path.basename(model_path)
+            self._addError(filename, model_path, error_msg)
 
     @call_on_qt_thread
     def _clearBuildPlate(self):
@@ -778,7 +787,7 @@ class AutoSlicerJob(Job):
                 time.sleep(0.1)
             
             if self._is_stopping:
-                raise Exception("Processing stopped by user")
+                return False  # Return false to indicate slicing failed due to stop
             
             # Wait for slice to complete
             timeout = self._slice_timeout  # Use user-configurable timeout
@@ -807,7 +816,7 @@ class AutoSlicerJob(Job):
                 time.sleep(0.5)
             
             if self._is_stopping:
-                raise Exception("Processing stopped by user")
+                return False  # Return false to indicate slicing failed due to stop
             
             # Check one more time for skip or cancellation before declaring success
             if self._is_skipping:
@@ -884,7 +893,7 @@ class AutoSlicerJob(Job):
                     time.sleep(0.1)
                 
                 if self._is_stopping:
-                    raise Exception("Processing stopped by user")
+                    return False  # Return false to indicate save failed due to stop
                 
                 if self._write_error:
                     Logger.log("e", f"Write operation failed: {self._write_error}")
